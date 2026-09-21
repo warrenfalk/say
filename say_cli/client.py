@@ -12,23 +12,46 @@ import threading
 import time
 
 from . import __version__
-from .common import TEXT_BLOCK, command, decode, encode, python_environment, runtime_dir
+from .common import (
+    MAX_MESSAGE,
+    PROTOCOL_VERSION,
+    TEXT_BLOCK,
+    command,
+    decode,
+    encode,
+    python_environment,
+    runtime_dir,
+)
+from .config import selected_output, validate_output
+from .outputs import choose_output, list_outputs
 
 
-def parse_args(argv: list[str]) -> list[str]:
+def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="say",
         description="Speak text locally. With no text arguments, read streaming UTF-8 from stdin.",
         epilog="Uses Pocket TTS, Charles, 7 sampler steps, and at most 180 text tokens per chunk.",
+        allow_abbrev=False,
     )
     parser.add_argument("--version", action="version", version=f"say {__version__}")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--output",
+        metavar="NAME",
+        type=validate_output,
+        help="output name for this request, or 'default' for the system default",
+    )
+    selection.add_argument("--list-outputs", action="store_true", help="list audio outputs")
+    selection.add_argument("--choose", action="store_true", help="choose and save the audio output")
     parser.add_argument(
         "text", nargs=argparse.REMAINDER, help="text to speak; use -- before leading -"
     )
-    words = parser.parse_args(argv).text
-    if words[:1] == ["--"]:
-        words = words[1:]
-    return words
+    options = parser.parse_args(argv)
+    if options.text[:1] == ["--"]:
+        options.text = options.text[1:]
+    if (options.choose or options.list_outputs) and options.text:
+        parser.error("--choose and --list-outputs cannot be combined with speech text")
+    return options
 
 
 def connect() -> socket.socket:
@@ -74,9 +97,24 @@ def connect() -> socket.socket:
         raise RuntimeError(f"Speech service did not start; see {directory / 'service.log'}")
 
 
-def send_input(sock: socket.socket, words: list[str], errors: list[Exception]):
+def negotiate(sock: socket.socket, replies):
+    # Old daemons ignore unknown start fields. Check capabilities before sending
+    # any speech, so they cannot silently route a selected output to the default.
+    sock.settimeout(5)
     try:
-        sock.sendall(encode({"type": "start", "stream": not words}))
+        sock.sendall(encode({"type": "hello", "protocol": PROTOCOL_VERSION}))
+        response = decode(replies.readline(MAX_MESSAGE + 1))
+    finally:
+        sock.settimeout(None)
+    if response != {"type": "ready", "protocol": PROTOCOL_VERSION}:
+        raise RuntimeError(
+            "The running speech service needs an update; restart say-service and retry"
+        )
+
+
+def send_input(sock: socket.socket, words: list[str], errors: list[Exception], output=None):
+    try:
+        sock.sendall(encode({"type": "start", "stream": not words, "output": output}))
         if words:
             text = " ".join(words)
             for offset in range(0, len(text), TEXT_BLOCK):
@@ -98,18 +136,29 @@ def send_input(sock: socket.socket, words: list[str], errors: list[Exception]):
 
 
 def main() -> int:
-    words = parse_args(sys.argv[1:])
-    if not words and sys.stdin.isatty():
-        print("Usage: say [--] TEXT ...  or  command | say", file=sys.stderr)
-        return 2
+    options = parse_args(sys.argv[1:])
     try:
+        if options.list_outputs:
+            list_outputs()
+            return 0
+        if options.choose:
+            choose_output()
+            return 0
+        words = options.text
+        if not words and sys.stdin.isatty():
+            print("Usage: say [--output NAME] [--] TEXT ...  or  command | say", file=sys.stderr)
+            return 2
+        output = selected_output(options.output)
         with connect() as sock:
             errors: list[Exception] = []
-            sender = threading.Thread(target=send_input, args=(sock, words, errors), daemon=True)
-            sender.start()
             try:
                 with sock.makefile("rb") as replies:
-                    line = replies.readline()
+                    negotiate(sock, replies)
+                    sender = threading.Thread(
+                        target=send_input, args=(sock, words, errors, output), daemon=True
+                    )
+                    sender.start()
+                    line = replies.readline(MAX_MESSAGE + 1)
                 if errors:
                     raise errors[0]
                 if not line:

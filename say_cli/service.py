@@ -10,8 +10,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .backend import Pocket
-from .common import IDLE_SECONDS, MAX_MESSAGE, TEXT_BLOCK, decode, encode, runtime_dir
+from .common import (
+    IDLE_SECONDS,
+    MAX_MESSAGE,
+    PROTOCOL_VERSION,
+    TEXT_BLOCK,
+    decode,
+    encode,
+    runtime_dir,
+)
+from .config import validate_output
 from .input import TextInput
+from .outputs import OutputUnavailable
 from .text import phrases
 
 
@@ -19,6 +29,7 @@ from .text import phrases
 class Request:
     writer: asyncio.StreamWriter
     streaming: bool
+    output: str | None = None
     parts: TextInput = field(default_factory=TextInput)
     done: asyncio.Event = field(default_factory=asyncio.Event)
     cancelled: bool = False
@@ -64,8 +75,16 @@ class Service:
         finished = None
         try:
             start = decode(await reader.readline())
+            if start.get("type") == "hello":
+                if start.get("protocol") != PROTOCOL_VERSION:
+                    raise RuntimeError("Incompatible speech client; update say and say-service")
+                await self.reply(writer, {"type": "ready", "protocol": PROTOCOL_VERSION})
+                start = decode(await reader.readline())
             if start.get("type") != "start" or not isinstance(start.get("stream"), bool):
                 raise ValueError("Invalid speech request")
+            output = start.get("output")
+            if output is not None:
+                validate_output(output)
             # An open, silent stdin must not take over the speech queue.
             while True:
                 message = decode(await reader.readline())
@@ -79,7 +98,7 @@ class Service:
                     raise ValueError("Text block is too large")
                 if text.strip():
                     break
-            request = Request(writer=writer, streaming=start["stream"])
+            request = Request(writer=writer, streaming=start["stream"], output=output)
             request.parts.put(text)
             try:
                 self.queue.put_nowait(request)
@@ -116,7 +135,7 @@ class Service:
         first = True
         try:
             async for text in phrases(request.parts, request.streaming):
-                await self.backend.speak(text, first)
+                await self.backend.speak(text, first, request.output)
                 first = False
             await self.backend.finish()
             await self.reply(request.writer, {"type": "done"})
@@ -125,6 +144,10 @@ class Service:
             # API. Stop its process so cancelled speech cannot leak into a job.
             await self.backend.close()
             raise
+        except OutputUnavailable as error:
+            # Selection is checked before starting synthesis or playback, so a
+            # missing output does not discard an already loaded model.
+            await self.reply(request.writer, {"type": "error", "message": str(error)})
         except Exception as error:  # noqa: BLE001 -- Report worker errors and keep the queue alive.
             await self.backend.close()
             await self.reply(request.writer, {"type": "error", "message": str(error)})

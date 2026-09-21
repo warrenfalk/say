@@ -9,6 +9,7 @@ from pathlib import Path
 MAX_MESSAGE = 64 * 1024
 TEXT_BLOCK = 4096
 IDLE_SECONDS = 30 * 60
+PROTOCOL_VERSION = 2
 
 
 def runtime_dir() -> Path:

@@ -17,7 +17,7 @@ def main():
         # Emulate a previous service that died without removing its socket.
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
             stale.bind(str(path / "say.sock"))
-        env = {**os.environ, "SAY_RUNTIME_DIR": directory}
+        env = {**os.environ, "SAY_RUNTIME_DIR": directory, "XDG_CONFIG_HOME": str(path / "config")}
         env.pop("PYTHONPATH", None)
         clients = []
         try:

@@ -7,7 +7,7 @@ name = 'say-local'
 version = '0.1.0'
 description = 'Queued, streaming speech on your local machine'
 requires-python = '>=3.11'
-dependencies = ['pocket-tts==3.1.0']
+dependencies = ['pocket-tts==3.1.0', 'tomlkit>=0.13,<1']
 
 [project.scripts]
 say = 'say_cli.client:main'

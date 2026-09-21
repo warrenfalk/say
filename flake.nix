@@ -43,14 +43,16 @@
           ];
         };
         build-system = [ python.pkgs.setuptools ];
-        dependencies = [ python.pkgs.pocket-tts ];
-        nativeCheckInputs = [ pkgs.ruff ];
+        dependencies = [ python.pkgs.pocket-tts python.pkgs.tomlkit ];
+        nativeCheckInputs = [ pkgs.ruff pkgs.pipewire pkgs.wireplumber pkgs.dbus ];
         checkPhase = ''
           runHook preCheck
           python -m unittest discover -s tests -v
           ruff check say_cli tests
           ruff format --check say_cli tests
           python tests/check_package.py "$out"
+          dbus-run-session --config-file=${pkgs.dbus}/share/dbus-1/session.conf -- \
+            python -m unittest discover -s tests -p check_pipewire.py -v
           runHook postCheck
         '';
         postInstall = ''
@@ -60,6 +62,7 @@
         makeWrapperArgs = [
           "--set SAY_MODEL_DIR ${models}"
           "--set SAY_PLAYER ${pkgs.pipewire}/bin/pw-cat"
+          "--set SAY_PW_DUMP ${pkgs.pipewire}/bin/pw-dump"
           "--set HF_HUB_OFFLINE 1"
           "--set HF_HUB_DISABLE_TELEMETRY 1"
           "--set DO_NOT_TRACK 1"
@@ -82,9 +85,10 @@
       };
       checks.${system}.default = say;
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ (python.withPackages (p: [ p.pocket-tts p.setuptools ])) pkgs.pipewire pkgs.ruff ];
+        packages = [ (python.withPackages (p: [ p.pocket-tts p.setuptools p.tomlkit ])) pkgs.pipewire pkgs.wireplumber pkgs.dbus pkgs.ruff ];
         SAY_MODEL_DIR = "${models}";
         SAY_PLAYER = "${pkgs.pipewire}/bin/pw-cat";
+        SAY_PW_DUMP = "${pkgs.pipewire}/bin/pw-dump";
         HF_HUB_OFFLINE = "1";
         HF_HUB_DISABLE_TELEMETRY = "1";
         DO_NOT_TRACK = "1";

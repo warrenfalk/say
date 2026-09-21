@@ -3,9 +3,11 @@
 import asyncio
 import base64
 import contextlib
+import json
 import os
 
 from .common import MAX_MESSAGE, command, decode, encode, python_environment
+from .outputs import find_output
 
 
 async def terminate(process):
@@ -26,6 +28,8 @@ class Pocket:
         self.worker = None
         self.player = None
         self.sample_rate = None
+        self.output = None
+        self.target = None
 
     @property
     def loaded(self):
@@ -61,7 +65,12 @@ class Pocket:
             raise RuntimeError("Pocket worker did not become ready")
         self.sample_rate = ready["sample_rate"]
 
-    async def speak(self, text: str, first: bool):
+    async def speak(self, text: str, first: bool, output: str | None = None):
+        if first:
+            self.output = output
+            # Resolve the saved name when its queue turn arrives. Target the
+            # specific node instance, even if it disappears during model load.
+            self.target = str((await find_output(output)).serial) if output is not None else None
         await self.load()
         self.worker.stdin.write(encode({"text": text, "reset_seed": first}))
         await self.worker.stdin.drain()
@@ -72,6 +81,20 @@ class Pocket:
             if event.get("type") != "audio":
                 raise RuntimeError("Unexpected Pocket worker message")
             if self.player is None:
+                routing = []
+                if self.target is not None:
+                    routing = [
+                        "--target",
+                        self.target,
+                        "--properties",
+                        json.dumps(
+                            {
+                                "node.dont-fallback": True,
+                                "node.dont-reconnect": True,
+                                "node.dont-move": True,
+                            }
+                        ),
+                    ]
                 self.player = await asyncio.create_subprocess_exec(
                     os.environ.get("SAY_PLAYER", "pw-cat"),
                     "--playback",
@@ -84,11 +107,20 @@ class Pocket:
                     "s16",
                     "--media-role",
                     "Notification",
+                    *routing,
                     "-",
                     stdin=asyncio.subprocess.PIPE,
                 )
-            self.player.stdin.write(base64.b64decode(event["pcm"], validate=True))
-            await self.player.stdin.drain()
+            try:
+                self.player.stdin.write(base64.b64decode(event["pcm"], validate=True))
+                await self.player.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as error:
+                raise RuntimeError(self.playback_error()) from error
+
+    def playback_error(self):
+        if self.output is not None:
+            return f"Audio playback failed on {self.output!r}; the output may have disconnected"
+        return "Audio playback failed; check the PipeWire output"
 
     async def finish(self):
         if self.player is None:
@@ -97,4 +129,4 @@ class Pocket:
         code = await self.player.wait()
         self.player = None
         if code:
-            raise RuntimeError(f"Audio playback failed (exit {code}); check the PipeWire output")
+            raise RuntimeError(f"{self.playback_error()} (exit {code})")

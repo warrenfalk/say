@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from say_cli.common import decode, encode
+from say_cli.outputs import OutputUnavailable
 from say_cli.service import Service
 
 
@@ -12,17 +13,21 @@ class Backend:
     def __init__(self):
         self.loaded = False
         self.spoken = []
+        self.destinations = []
         self.finishes = 0
         self.loads = 0
         self.unloads = 0
         self.gate = asyncio.Event()
         self.gate.set()
 
-    async def speak(self, text, first):
+    async def speak(self, text, first, output=None):
+        if output == "gone":
+            raise OutputUnavailable("Audio output 'gone' is unavailable")
         if not self.loaded:
             self.loaded = True
             self.loads += 1
         self.spoken.append(text)
+        self.destinations.append((text, output))
         if text == "fail":
             raise RuntimeError("test synthesis failure")
 
@@ -62,10 +67,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.close()
         self.directory.cleanup()
 
-    async def client(self, text=None, end=True, streaming=False):
+    async def client(self, text=None, end=True, streaming=False, output=None):
         reader, writer = await asyncio.open_unix_connection(self.path)
         self.writers.append(writer)
-        writer.write(encode({"type": "start", "stream": streaming}))
+        writer.write(encode({"type": "start", "stream": streaming, "output": output}))
         if text is not None:
             writer.write(encode({"type": "text", "text": text}))
         if end:
@@ -89,6 +94,55 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backend.spoken, ["first", "second"])
         self.assertEqual(self.backend.finishes, 2)
         self.assertEqual(self.backend.loads, 1)
+
+    async def test_each_stream_keeps_its_output_through_its_queue_turn(self):
+        first, writer = await self.client("First. ", end=False, streaming=True, output="headphones")
+        await eventually(lambda: bool(self.backend.spoken))
+        second, _ = await self.client("Second", output="speakers")
+        third, _ = await self.client("Third")
+        await eventually(lambda: self.service.queue.qsize() == 2)
+        writer.write(encode({"type": "text", "text": "Still first."}))
+        writer.write(encode({"type": "end"}))
+        await writer.drain()
+        for reader in (first, second, third):
+            self.assertEqual(await self.reply(reader), {"type": "done"})
+        self.assertEqual(
+            self.backend.destinations,
+            [
+                ("First. ", "headphones"),
+                ("Still first.", "headphones"),
+                ("Second", "speakers"),
+                ("Third", None),
+            ],
+        )
+        self.assertEqual(self.backend.loads, 1)
+
+    async def test_missing_output_preserves_model_and_next_request(self):
+        self.backend.gate.clear()
+        first, _ = await self.client("First", output="headphones")
+        await eventually(lambda: bool(self.backend.spoken))
+        missing, _ = await self.client("Do not speak", output="gone")
+        next_reader, _ = await self.client("Next", output="speakers")
+        self.backend.gate.set()
+        self.assertEqual(await self.reply(first), {"type": "done"})
+        reply = await self.reply(missing)
+        self.assertEqual(reply["type"], "error")
+        self.assertIn("unavailable", reply["message"])
+        self.assertEqual(await self.reply(next_reader), {"type": "done"})
+        self.assertEqual(self.backend.spoken, ["First", "Next"])
+        self.assertEqual(self.backend.loads, 1)
+        self.assertEqual(self.backend.unloads, 0)
+
+    async def test_handshake_and_invalid_output_do_not_load_model(self):
+        reader, writer = await asyncio.open_unix_connection(self.path)
+        self.writers.append(writer)
+        writer.write(encode({"type": "hello", "protocol": 2}))
+        await writer.drain()
+        self.assertEqual(await self.reply(reader), {"type": "ready", "protocol": 2})
+        writer.write(encode({"type": "start", "stream": False, "output": 123}))
+        await writer.drain()
+        self.assertEqual((await self.reply(reader))["type"], "error")
+        self.assertEqual(self.backend.loads, 0)
 
     async def test_stream_speaks_before_eof_and_keeps_its_place(self):
         first, writer = await self.client("One sentence. ", end=False, streaming=True)

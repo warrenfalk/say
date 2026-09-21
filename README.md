@@ -11,10 +11,49 @@ some-command | say
 ```
 
 `say` waits until playback finishes. `--` ends option parsing; options after the
-first text argument are also spoken literally. `--help` and `--version` are the
-only options for now. No arguments reads UTF-8 stdin; no arguments at a terminal
+first text argument are also spoken literally. Options must precede speech text.
+No arguments reads UTF-8 stdin; no arguments at a terminal
 prints usage. Empty input succeeds silently. Errors go to stderr; successful
 speech writes nothing to stdout.
+
+## Audio output
+
+```sh
+say --choose
+say --list-outputs
+say --output NAME 'Hello World!'
+say --output default 'Use the system default this time.'
+some-command | say --output NAME
+```
+
+`--choose` shows a numbered terminal menu with friendly output descriptions and
+marks the saved selection. Choose **System default** to follow normal system
+routing again. Enter, `q`, EOF, or Ctrl+C cancels without changing preferences.
+`--list-outputs` shows descriptions and the names accepted by `--output`, including
+virtual outputs. These commands do not start the speech service or load the model.
+
+The preference is stored in `$XDG_CONFIG_HOME/say/config.toml`, normally
+`~/.config/say/config.toml`:
+
+```toml
+output = "alsa_output.example.analog-stereo"
+```
+
+An explicit `--output` takes precedence over the saved preference. With neither,
+speech uses the system default. `--output default` bypasses the saved preference
+for one invocation. The picker saves atomically and preserves existing comments
+and other settings. This preference applies to `say` and is local to the user.
+
+The client reads preferences for each invocation. Each queued request retains its
+selection through all streamed phrases; changing the preference needs no service
+restart or model reload. A named output is resolved when its queue turn arrives.
+An unavailable or disconnected selected output produces an error, without falling
+back to another device. Use `--choose` to select another output, or explicitly
+request `--output default`.
+
+After upgrading an older running service to this version, restart it once as
+described below. The client checks the service's routing support before sending
+text, so an old service cannot silently ignore an output selection.
 
 ## Speech and streaming
 
@@ -23,7 +62,7 @@ The fixed defaults are Pocket TTS 3.1.0, the April 2026 English model, Charles,
 match the listening-room demo: temperature 0.3, seed 42 per request, no INT8
 quantization or noise clamp, EOS threshold -4, and automatic trailing frames.
 
-Audio plays through PipeWire's default output device as it is generated. Piped
+Audio plays through the selected PipeWire output as it is generated. Piped
 text begins speaking before EOF: sentence endings and newlines release text, and
 a 750 ms pause releases an unfinished phrase. Pending text is also bounded at
 1,200 characters; Pocket applies its 180-token limit within each submitted
@@ -112,17 +151,25 @@ nix develop path:. -c ruff format --check .
 nix flake check path:.
 ```
 
-The socket-level tests cover FIFO playback, incremental stdin, UTF-8, cancellation,
-idle unloading, failure recovery and empty input without making audible speech.
+The tests cover FIFO playback, per-request outputs, config precedence and saving,
+picker cancellation, incremental stdin, UTF-8, cancellation, idle unloading,
+failure recovery and empty input without making audible speech.
 The Nix build runs these checks and verifies simultaneous service autostarts from
-outside the checkout, including recovery of a stale socket. Live model and
-playback checks are separate.
+outside the checkout, including recovery of a stale socket. It also starts a
+private PipeWire graph with virtual outputs to check routing and disconnection
+without touching audio hardware. Run that check separately with:
+
+```sh
+nix develop path:. -c dbus-run-session -- python -m unittest discover -s tests -p check_pipewire.py -v
+```
+
+Live model and physical playback checks are separate.
 
 `SAY_RUNTIME_DIR` selects an isolated private runtime directory for development.
-`SAY_MODEL_DIR` and `SAY_PLAYER` are supplied by the flake; the installed wrappers
+`SAY_MODEL_DIR`, `SAY_PLAYER`, and `SAY_PW_DUMP` are supplied by the flake; the installed wrappers
 pin them to their Nix store paths. These are integration settings, not synthesis
-tuning options. Only the worker imports Pocket/PyTorch; the queue and CLI use the
-Python standard library.
+tuning options. Only the worker imports Pocket/PyTorch. TOMLKit preserves comments
+and formatting when the CLI saves preferences; audio discovery uses `pw-dump`.
 
 Before updating the inference runtime, check that synthesis keeps ahead of playback:
 
